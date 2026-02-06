@@ -58,6 +58,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ======================================================================================
+# HELPERS
+# ======================================================================================
+
+def normalize_date(date_str: Optional[str]) -> Optional[str]:
+    """
+    Attempts to parse a date string into YYYY-MM-DD.
+    Handles YYYY-MM-DD, DD.MM.YYYY, DD/MM/YYYY.
+    """
+    if not date_str:
+        return None
+
+    # Common formats to check
+    # We prioritize Austrian/German format (DD.MM.YYYY) if ambiguous,
+    # but YYYY-MM-DD is the ISO standard the AI should return.
+    formats = [
+        "%Y-%m-%d",  # 2023-12-31
+        "%d.%m.%Y",  # 31.12.2023
+        "%d/%m/%Y",  # 31/12/2023
+        "%Y.%m.%d",  # 2023.12.31
+    ]
+
+    for fmt in formats:
+        try:
+            dt = datetime.datetime.strptime(date_str, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    logger.warning(f"Could not parse date: {date_str}")
+    return None
+
+# ======================================================================================
 # CLIENTS
 # ======================================================================================
 
@@ -175,12 +207,12 @@ class OllamaClient:
 
         prompt = f"""
         You are an intelligent data extraction assistant.
-        Analyze the following invoice text and extract the specific metadata in strictly valid JSON format.
+        Analyze the following invoice text (likely Austrian/German context) and extract the specific metadata in strictly valid JSON format.
 
         Required Fields:
         - vendor_name: (String) Name of the company/seller.
-        - invoice_date: (String) Format YYYY-MM-DD.
-        - payment_due_date: (String) Format YYYY-MM-DD.
+        - invoice_date: (String) The document date. PREFERRED FORMAT: YYYY-MM-DD.
+        - payment_due_date: (String) The due date. PREFERRED FORMAT: YYYY-MM-DD.
         - invoice_number: (String) The invoice identifier.
         - total_amount: (Number/Float) The final total amount (Brutto).
         - net_amount: (Number/Float) The net amount before tax.
@@ -189,8 +221,8 @@ class OllamaClient:
         - currency: (String) e.g., EUR, USD.
 
         Instructions:
+        - The invoice might use dates in DD.MM.YYYY format (e.g., 31.01.2023). Convert these to YYYY-MM-DD.
         - If a field is not found, use null.
-        - Convert all dates to YYYY-MM-DD.
         - Do not include markdown code blocks (like ```json), just the raw JSON string.
         - Be precise.
 
@@ -269,7 +301,6 @@ def process_document(doc_id: int, paperless: PaperlessClient, ollama: OllamaClie
 
     # 6. Prepare Updates
     updates = {}
-    custom_fields_updates = []
 
     # A. Vendor / Correspondent
     vendor_name = data.get("vendor_name")
@@ -281,14 +312,12 @@ def process_document(doc_id: int, paperless: PaperlessClient, ollama: OllamaClie
         updates["correspondent"] = c_id
 
     # B. Created Date (Invoice Date)
-    inv_date = data.get("invoice_date")
-    if inv_date:
-        # Validate date format roughly
-        try:
-            datetime.datetime.strptime(inv_date, "%Y-%m-%d")
-            updates["created"] = inv_date
-        except ValueError:
-            logger.warning(f"Invalid date format received: {inv_date}")
+    raw_date = data.get("invoice_date")
+    clean_date = normalize_date(raw_date)
+    if clean_date:
+        updates["created"] = clean_date
+    elif raw_date:
+        logger.warning(f"Could not normalize invoice date: {raw_date}")
 
     # C. Storage Path
     sp_id = paperless.get_storage_path_id(STORAGE_PATH_NAME)
@@ -313,10 +342,12 @@ def process_document(doc_id: int, paperless: PaperlessClient, ollama: OllamaClie
         if paperless_name in existing_fields_map:
             field_id = existing_fields_map[paperless_name]
             val = data.get(ai_key)
+
+            # Special handling for dates in custom fields
+            if ai_key == "payment_due_date" and val:
+                 val = normalize_date(val)
+
             if val is not None:
-                # Handle Monetary types (sometimes require special formatting, but usually string/float works)
-                # Paperless often expects Monetary to be just the number if currency is implicit, or we might need to check field type.
-                # Assuming simple value assignment works for now.
                 cf_data_map[field_id] = val
         else:
             logger.warning(f"Custom field '{paperless_name}' not defined in Paperless.")

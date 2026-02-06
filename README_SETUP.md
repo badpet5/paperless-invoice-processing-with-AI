@@ -8,9 +8,9 @@ This script integrates your Paperless-ngx instance (on TrueNAS Scale) with your 
     *   Ensure Ollama is running on your PC.
     *   Ensure it accepts external connections. Set the environment variable `OLLAMA_HOST=0.0.0.0` on your PC.
     *   Pull the model: `ollama pull qwen2.5:32b` (or your preferred model).
-2.  **Paperless-ngx on NAS:**
-    *   Must be running and accessible.
-    *   You need access to the `media/scripts` (or equivalent) folder mapped in your Docker container.
+2.  **Paperless-ngx on TrueNAS Scale:**
+    *   Must be running.
+    *   You need to generate an API Token in Paperless (Settings -> Admin -> API Tokens).
 
 ## Step 1: Prepare Paperless-ngx
 
@@ -31,61 +31,73 @@ Before running the script, you must create the following items in your Paperless
         *   `Payment Due Date` (Date)
         *   `Seller UID/VAT ID` (Text)
 
-## Step 2: Configure the Script
+## Step 2: Installation on TrueNAS Scale
 
-You can configure the script either by editing the file directly OR by setting environment variables in your Docker container.
+The best way to run this script on TrueNAS Scale is to execute it *inside* the Paperless container using a Cron Job defined in the TrueNAS UI. This ensures all Python dependencies (like `requests`) are available without modifying the host system.
 
-### Option A: Environment Variables (Recommended for Docker)
-Add these variables to your Paperless container configuration in TrueNAS:
-*   `PAPERLESS_API_TOKEN`: Your generated API Token.
-*   `OLLAMA_HOST`: The URL of your PC (e.g., `http://192.168.1.100:11434`).
-*   `OLLAMA_MODEL`: The model name (default: `qwen2.5:32b`).
+### 2.1 Place the Script
+1.  Access your TrueNAS datasets (via SMB or Shell).
+2.  Place `paperless_ai_processor.py` in a folder that is **mounted** inside your Paperless container.
+    *   *Default TrueNAS App:* The `/library` dataset is often mounted to `/usr/src/paperless/data` or `/usr/src/paperless/media`.
+    *   *Recommendation:* Put it in your Paperless `media` folder, e.g., `.../paperless/media/scripts/paperless_ai_processor.py`.
 
-### Option B: Edit the Script
-1.  Open `paperless_ai_processor.py` in a text editor.
-2.  **Update Variables:**
-    *   `PAPERLESS_API_TOKEN`: Replace `YOUR_PAPERLESS_API_TOKEN_HERE`.
-    *   `OLLAMA_HOST`: Replace `http://YOUR_PC_IP_HERE:11434`.
+### 2.2 Configure Environment Variables
+You need to pass the configuration to the script. Since we will run this via Cron, we can either hardcode them in the script (Option A) or pass them in the cron command (Option B).
 
-## Step 3: Installation on TrueNAS
+**Option A (Edit Script - Easiest):**
+Open `paperless_ai_processor.py` and edit the top section:
+```python
+PAPERLESS_URL = "http://localhost:8000" # Localhost works because script runs INSIDE container
+PAPERLESS_API_TOKEN = "your_actual_token_here"
+OLLAMA_HOST = "http://192.168.1.55:11434" # IP of your PC
+```
 
-1.  **Locate Scripts Folder:** Find the folder on your NAS that is mounted to `/usr/src/paperless/scripts` (or just `/scripts`) inside the Paperless container.
-2.  **Copy Script:** Place `paperless_ai_processor.py` into this folder.
-3.  **Permissions:** Ensure the script is executable. You might need to SSH into the NAS or Container and run:
+**Option B (Environment Variables):**
+You will add these to the Cron command later.
+
+## Step 3: Setup Automation (Cron Job)
+
+To ensure documents are processed even if your PC was off, we set up a Cron Job to run the script periodically (e.g., every hour).
+
+1.  **Log in to TrueNAS Web UI.**
+2.  Go to **System Settings** -> **Advanced** -> **Cron Jobs**.
+3.  Click **Add**.
+4.  **Description:** `Paperless AI Processing`
+5.  **Command:**
+    We need a command that finds the running Paperless pod and executes the script inside it. Use this command:
+
     ```bash
-    chmod +x /usr/src/paperless/scripts/paperless_ai_processor.py
+    k3s kubectl get pods -n ix-paperless-ngx -o name | grep paperless-ngx | head -n 1 | xargs -I {} k3s kubectl exec -n ix-paperless-ngx {} -- python3 /usr/src/paperless/media/scripts/paperless_ai_processor.py
     ```
 
-## Step 4: Configure Post-Consumption Trigger
+    *Important Notes on the Command:*
+    *   `-n ix-paperless-ngx`: This is the default namespace for the TrueNAS Official App. If you named your app differently (e.g. `paperless`), change this to `-n ix-paperless`. You can check namespaces via `k3s kubectl get ns`.
+    *   `/usr/src/paperless/media/scripts/...`: This path depends on where you put the file in **Step 2.1**. Adjust the path to match where the file lives *inside* the container.
+    *   If you chose **Option B** for variables, the command looks like:
+        ```bash
+        k3s kubectl get pods -n ix-paperless-ngx -o name | grep paperless-ngx | head -n 1 | xargs -I {} k3s kubectl exec -n ix-paperless-ngx --env PAPERLESS_API_TOKEN=xxx --env OLLAMA_HOST=http://192.168.1.55:11434 {} -- python3 /usr/src/paperless/media/scripts/paperless_ai_processor.py
+        ```
 
-1.  To run immediately after a document is imported:
-    *   There isn't a direct "GUI" setting for post-consumption scripts in some versions. You typically set the environment variable `PAPERLESS_POST_CONSUMPTION_SCRIPT` in your container configuration.
-    *   Set it to: `/usr/src/paperless/scripts/paperless_ai_processor.py`
-    *   **Restart** the Paperless container.
+6.  **Schedule:**
+    *   Select `Hourly` or `Daily` (e.g., run at 2 AM and 2 PM).
+7.  **User:** `root` (Required to run kubectl).
+8.  **Save.**
 
-*Note: This will run the script for EVERY document. The script itself checks for the `AI processing needed` tag and exits immediately if it's missing, so it's safe.*
+### 2.3 Immediate Trigger (Optional)
+If you want the script to run *immediately* after a document is consumed (real-time), you can set the `PAPERLESS_POST_CONSUMPTION_SCRIPT` environment variable in the TrueNAS App Config:
 
-## Step 5: Setup "Batch Mode" (Retry)
-
-If your PC is gaming (Ollama is busy), the script will skip processing. You need a way to retry later.
-
-1.  **Cron Job:** Set up a cron job on the NAS (or inside the container if it persists) to run the script every hour.
-    ```bash
-    # Run every hour
-    0 * * * * /usr/src/paperless/scripts/paperless_ai_processor.py
-    ```
-2.  When running without the `DOCUMENT_ID` environment variable, the script automatically enters **Batch Mode**, finds all documents with `AI processing needed`, and processes them.
+1.  Edit the Paperless App in TrueNAS.
+2.  Add Environment Variable:
+    *   Key: `PAPERLESS_POST_CONSUMPTION_SCRIPT`
+    *   Value: `/usr/src/paperless/media/scripts/paperless_ai_processor.py`
+3.  **Note:** This works alongside the Cron Job. The script is smart enough to exit if Ollama is offline, and the Cron Job will pick it up later.
 
 ## Usage Workflow
 
-1.  Scan/Email an Invoice.
-2.  **Important:** Ensure the import process adds the tag `AI processing needed`.
-    *   You can do this via a **Workflow** in Paperless:
-        *   Trigger: Document Added
-        *   Filter: Mime Type is PDF (or specific mail rule)
-        *   Action: Assign Tag `AI processing needed`
-3.  Paperless consumes the file.
-4.  The script runs.
-    *   If Ollama is free -> Extracts data, moves file, updates fields, swaps tag to `AI processed`.
-    *   If Ollama is busy -> Exits.
-5.  If skipped, the hourly Cron job picks it up later.
+1.  **Scan/Import:** Upload a document to Paperless.
+2.  **Tag:** Ensure it gets the tag `AI processing needed`.
+    *   *Tip:* Create a Workflow in Paperless: "If document created, assign tag 'AI processing needed'".
+3.  **Processing:**
+    *   The script (via Cron or Post-Consumption) checks availability of your PC.
+    *   If PC is **On**: Data is extracted, fields updated, tag swapped to `AI processed`.
+    *   If PC is **Off**: Script exits. The next Cron run will retry.
